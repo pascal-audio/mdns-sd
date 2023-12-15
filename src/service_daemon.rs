@@ -1170,15 +1170,15 @@ impl Zeroconf {
     /// Returns the list of interface IPs that sent out the annoucement.
     fn send_unsolicited_response(&self, info: &ServiceInfo) -> Vec<IpAddr> {
         let mut outgoing_addrs = Vec::new();
-        let mut netmask_set: HashSet<u128> = HashSet::new();
+        // let mut netmask_set: HashSet<u128> = HashSet::new();
 
         for (_, intf_sock) in self.intf_socks.iter() {
-            let netmask = ifaddr_netmask(&intf_sock.intf.addr);
-            if netmask_set.contains(&netmask) {
-                continue; // no need to send again in the same subnet.
-            }
+            // let netmask = ifaddr_netmask(&intf_sock.intf.addr);
+            // if netmask_set.contains(&netmask) {
+            //     continue; // no need to send again in the same subnet.
+            // }
             if self.broadcast_service_on_intf(info, intf_sock) {
-                netmask_set.insert(netmask);
+                // netmask_set.insert(netmask);
                 outgoing_addrs.push(intf_sock.intf.ip());
             }
         }
@@ -1347,13 +1347,13 @@ impl Zeroconf {
         let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
         out.add_question(name, qtype);
 
-        let mut netmask_set: HashSet<u128> = HashSet::new();
+        // let mut netmask_set: HashSet<u128> = HashSet::new();
         for (_, intf_sock) in self.intf_socks.iter() {
-            let netmask = ifaddr_netmask(&intf_sock.intf.addr);
-            if netmask_set.contains(&netmask) {
-                continue; // no need to send query the same subnet again.
-            }
-            netmask_set.insert(netmask);
+            // let netmask = ifaddr_netmask(&intf_sock.intf.addr);
+            // if netmask_set.contains(&netmask) {
+            //     continue; // no need to send query the same subnet again.
+            // }
+            // netmask_set.insert(netmask);
             broadcast_dns_on_intf(&out, intf_sock);
         }
     }
