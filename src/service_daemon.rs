@@ -475,9 +475,9 @@ impl ServiceDaemon {
                 }
             }
 
-            // Send out additional queries for unresolved instances, where
-            // the early responses did not have SRV records.
-            zc.query_missing_srv();
+            // // Send out additional queries for unresolved instances, where
+            // // the early responses did not have SRV records.
+            // zc.query_missing_srv();
 
             // process commands from the command channel
             while let Ok(command) = receiver.try_recv() {
