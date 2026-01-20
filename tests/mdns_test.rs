@@ -1173,76 +1173,6 @@ fn service_new_publish_after_browser() {
     daemon.shutdown().unwrap();
 }
 
-// This test covers the sanity check in `read_others` decoding RDATA.
-#[test]
-fn instance_name_two_dots() {
-    // Create a daemon for the server.
-    let server_daemon = ServiceDaemon::new().expect("Failed to create server daemon");
-    let monitor = server_daemon.monitor().unwrap();
-
-    // Register an instance name with a ending dot.
-    // Then the full name will have two dots in the middle.
-    // This would create a PTR record RDATA with a skewed name field.
-    let service_type = "_two-dots._udp.local.";
-    let instance_name = "my_instance.";
-    let host_ipv4 = "";
-    let host_name = "my_host.local.";
-    let port = 5200;
-    let my_service = ServiceInfo::new(
-        service_type,
-        instance_name,
-        host_name,
-        host_ipv4,
-        port,
-        None,
-    )
-    .expect("valid service info")
-    .enable_addr_auto();
-    let result = server_daemon.register(my_service.clone());
-    assert!(result.is_ok());
-
-    // Verify that the service was published successfully.
-    let mut published = false;
-    let publish_timeout = 1200;
-    while let Ok(event) = monitor.recv_timeout(Duration::from_millis(publish_timeout)) {
-        match event {
-            DaemonEvent::Announce(_, _) => {
-                published = true;
-                break;
-            }
-            other => {
-                println!("other daemon events: {:?}", other);
-            }
-        }
-    }
-    assert!(published);
-
-    // Browse the service.
-    let receiver = server_daemon.browse(service_type).unwrap();
-    let mut resolved = false;
-    let timeout = Duration::from_secs(2);
-    loop {
-        match receiver.recv_timeout(timeout) {
-            Ok(event) => match event {
-                ServiceEvent::ServiceResolved(_) => {
-                    resolved = true;
-                    break;
-                }
-                e => {
-                    println!("Received event {:?}", e);
-                }
-            },
-            Err(e) => {
-                println!("browse error: {}", e);
-                break;
-            }
-        }
-    }
-
-    assert!(!resolved);
-    server_daemon.shutdown().unwrap();
-}
-
 fn my_ip_interfaces() -> Vec<Interface> {
     // Use a random port for binding test.
     let test_port = fastrand::u16(8000u16..9000u16);
@@ -2465,6 +2395,68 @@ fn test_set_ip_check_interval() {
     server.set_ip_check_interval(0).unwrap();
     let interval = server.get_ip_check_interval().unwrap();
     assert_eq!(interval, 0);
+
+    server.shutdown().unwrap();
+}
+
+#[test]
+fn test_rfc6763_escaping() {
+    // Test RFC 6763 Section 4.3: dots and backslashes must be escaped
+    let instance_name = "My.Path\\Service";
+    let service_type = "_rfc6763._tcp.local.";
+
+    let service = ServiceInfo::new(
+        service_type,
+        instance_name,
+        "rfc6763.local.",
+        "",
+        5555,
+        None,
+    )
+    .expect("Failed to create service");
+
+    // Verify escaping: dots become \. and backslashes become \\
+    let fullname = service.get_fullname();
+    println!("Escaping test: {}", fullname);
+    assert!(
+        fullname.contains("My\\.Path\\\\Service"),
+        "Dots and backslashes should be escaped"
+    );
+}
+
+#[test]
+fn test_rfc6763_utf8_support() {
+    // Test RFC 6763 Section 4.1.1: UTF-8 support including emojis
+    // Also verify UTF-8 works with escaping (dots and backslashes)
+
+    let service1 = ServiceInfo::new(
+        "_utf8._tcp.local.",
+        "mdns.lib 🌐",
+        "test.local.",
+        "",
+        80,
+        None,
+    )
+    .expect("Failed to create service with emojis");
+    assert!(service1.get_fullname().contains("mdns\\.lib 🌐"));
+
+    // UTF-8 + escaping: "Café €.v1\2024"
+    let service2 = ServiceInfo::new(
+        "_utf8escape._tcp.local.",
+        "Café €.v1\\2024",
+        "test.local.",
+        "",
+        80,
+        None,
+    )
+    .expect("Failed to create service with UTF-8 and escapes");
+
+    let fullname = service2.get_fullname();
+    println!("UTF-8 + escaping fullname: {}", fullname);
+    assert!(
+        fullname.contains("Café €\\.v1\\\\2024"),
+        "UTF-8 preserved, dots and backslashes escaped"
+    );
 }
 
 /// A helper function to include a timestamp for println.
