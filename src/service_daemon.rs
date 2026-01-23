@@ -316,26 +316,19 @@ impl ServiceDaemon {
     fn send_cmd(&self, cmd: Command) -> Result<()> {
         let cmd_name = cmd.to_string();
 
-        // First, send to the flume channel.
+        // First, send to the flume channel - this is the important part.
         self.sender.try_send(cmd).map_err(|e| match e {
             TrySendError::Full(_) => Error::Again,
             e => e_fmt!("flume::channel::send failed: {}", e),
         })?;
 
-        // Second, send a signal to notify the daemon.
+        // Second, send a signal to notify the daemon (best effort).
+        // The command is already in the channel, so it will be processed
+        // on the next poll iteration even if the signal fails.
         let addr = SocketAddrV4::new(LOOPBACK_V4, 0);
-        let socket = UdpSocket::bind(addr)
-            .map_err(|e| e_fmt!("Failed to create socket to send signal: {}", e))?;
-        socket
-            .send_to(cmd_name.as_bytes(), self.signal_addr)
-            .map_err(|e| {
-                e_fmt!(
-                    "signal socket send_to {} ({}) failed: {}",
-                    self.signal_addr,
-                    cmd_name,
-                    e
-                )
-            })?;
+        if let Ok(socket) = UdpSocket::bind(addr) {
+            let _ = socket.send_to(cmd_name.as_bytes(), self.signal_addr);
+        }
 
         Ok(())
     }
@@ -1202,19 +1195,13 @@ impl Zeroconf {
             e => e_fmt!("flume::channel::send failed: {}", e),
         })?;
 
+        // Best effort signal - don't fail if socket operations fail.
+        // The command is already in the channel, so it will be processed
+        // on the next poll iteration even if the signal fails.
         let addr = SocketAddrV4::new(LOOPBACK_V4, 0);
-        let socket = UdpSocket::bind(addr)
-            .map_err(|e| e_fmt!("Failed to create socket to send signal: {}", e))?;
-        socket
-            .send_to(cmd_name.as_bytes(), self.signal_addr)
-            .map_err(|e| {
-                e_fmt!(
-                    "signal socket send_to {} ({}) failed: {}",
-                    self.signal_addr,
-                    cmd_name,
-                    e
-                )
-            })?;
+        if let Ok(socket) = UdpSocket::bind(addr) {
+            let _ = socket.send_to(cmd_name.as_bytes(), self.signal_addr);
+        }
 
         Ok(())
     }
@@ -1975,7 +1962,9 @@ impl Zeroconf {
             }
         }
 
-        let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
+        if !invalid_intf_addrs.is_empty() {
+            let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
+        }
 
         // RFC 6762 section 8.3.
         // ..The Multicast DNS responder MUST send at least two unsolicited
@@ -2126,7 +2115,9 @@ impl Zeroconf {
             self.handle_probing_for_index(if_index, now, &mut invalid_intf_addrs);
         }
 
-        let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
+        if !invalid_intf_addrs.is_empty() {
+            let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
+        }
     }
 
     fn unregister_service(&self, info: &ServiceInfo, if_index: u32, is_ipv4: bool) -> Vec<u8> {
@@ -2294,7 +2285,9 @@ impl Zeroconf {
             }
         }
 
-        let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
+        if !invalid_intf_addrs.is_empty() {
+            let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
+        }
     }
 
     /// Reads one UDP datagram from the socket of `intf`.
