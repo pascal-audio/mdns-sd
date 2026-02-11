@@ -297,12 +297,9 @@ impl ServiceDaemon {
 
         // Spawn the daemon thread
         let mio_sock = MioUdpSocket::from_std(signal_sock);
-        let cmd_sender = sender.clone();
         thread::Builder::new()
             .name("mDNS_daemon".to_string())
-            .spawn(move || {
-                Self::daemon_thread(mio_sock, poller, receiver, port, cmd_sender, signal_addr)
-            })
+            .spawn(move || Self::daemon_thread(mio_sock, poller, receiver, port))
             .map_err(|e| e_fmt!("thread builder failed to spawn: {}", e))?;
 
         Ok(Self {
@@ -642,10 +639,8 @@ impl ServiceDaemon {
         poller: Poll,
         receiver: Receiver<Command>,
         port: u16,
-        cmd_sender: Sender<Command>,
-        signal_addr: SocketAddr,
     ) {
-        let mut zc = Zeroconf::new(signal_sock, poller, port, cmd_sender, signal_addr);
+        let mut zc = Zeroconf::new(signal_sock, poller, port);
 
         if let Some(cmd) = zc.run(receiver) {
             match cmd {
@@ -947,9 +942,7 @@ struct Zeroconf {
 
     include_apple_p2p: bool,
 
-    cmd_sender: Sender<Command>,
-
-    signal_addr: SocketAddr,
+    pending_intf_cleanup: HashSet<Interface>,
 
     #[cfg(test)]
     test_down_interfaces: HashSet<String>,
@@ -982,13 +975,7 @@ fn join_multicast_group(my_sock: &PktInfoUdpSocket, intf: &Interface) -> Result<
 }
 
 impl Zeroconf {
-    fn new(
-        signal_sock: MioUdpSocket,
-        poller: Poll,
-        port: u16,
-        cmd_sender: Sender<Command>,
-        signal_addr: SocketAddr,
-    ) -> Self {
+    fn new(signal_sock: MioUdpSocket, poller: Poll, port: u16) -> Self {
         // Get interfaces.
         let my_ifaddrs = my_ip_interfaces(true);
 
@@ -1124,29 +1111,26 @@ impl Zeroconf {
             multicast_loop_v6: true,
             accept_unsolicited: false,
             include_apple_p2p: false,
-            cmd_sender,
-            signal_addr,
+            pending_intf_cleanup: HashSet::new(),
 
             #[cfg(test)]
             test_down_interfaces: HashSet::new(),
         }
     }
 
-    /// Send a Command into the daemon channel and poke the signal socket to wake the poll loop.
-    fn send_cmd_to_self(&self, cmd: Command) -> Result<()> {
-        let cmd_name = cmd.to_string();
-
-        self.cmd_sender.try_send(cmd).map_err(|e| match e {
-            TrySendError::Full(_) => Error::Again,
-            e => e_fmt!("flume::channel::send failed: {}", e),
-        })?;
-
-        let addr = SocketAddrV4::new(LOOPBACK_V4, 0);
-        if let Ok(socket) = UdpSocket::bind(addr) {
-            let _ = socket.send_to(cmd_name.as_bytes(), self.signal_addr);
+    /// Process pending interface cleanup: remove stale interfaces that reported
+    /// `AddrNotAvailable` during the current iteration.
+    fn process_pending_intf_cleanup(&mut self) {
+        if self.pending_intf_cleanup.is_empty() {
+            return;
         }
 
-        Ok(())
+        let intfs: Vec<Interface> = self.pending_intf_cleanup.drain().collect();
+        for intf in intfs {
+            self.del_interface_addr(&intf);
+        }
+
+        self.check_ip_changes();
     }
 
     /// Clean up all resources before shutdown.
@@ -1167,11 +1151,13 @@ impl Zeroconf {
 
                 for intf in self.my_intfs.values() {
                     if let Some(sock) = self.ipv4_sock.as_ref() {
-                        self.unregister_service(info, intf, &sock.pktinfo);
+                        let (_, invalid) = self.unregister_service(info, intf, &sock.pktinfo);
+                        self.pending_intf_cleanup.extend(invalid);
                     }
 
                     if let Some(sock) = self.ipv6_sock.as_ref() {
-                        self.unregister_service(info, intf, &sock.pktinfo);
+                        let (_, invalid) = self.unregister_service(info, intf, &sock.pktinfo);
+                        self.pending_intf_cleanup.extend(invalid);
                     }
                 }
             }
@@ -1341,14 +1327,23 @@ impl Zeroconf {
             self.refresh_active_services();
 
             // Refresh cached A/AAAA records with active queriers
-            let mut query_count = 0;
-            for (hostname, _sender) in self.hostname_resolvers.iter() {
-                for (hostname, ip_addr) in
-                    self.cache.refresh_due_hostname_resolutions(hostname).iter()
-                {
-                    self.send_query(hostname, ip_address_rr_type(&ip_addr.to_ip_addr()));
-                    query_count += 1;
-                }
+            let hostname_queries: Vec<(String, RRType)> = self
+                .hostname_resolvers
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flat_map(|hostname| {
+                    self.cache
+                        .refresh_due_hostname_resolutions(&hostname)
+                        .into_iter()
+                        .map(|(h, ip)| (h, ip_address_rr_type(&ip.to_ip_addr())))
+                })
+                .collect();
+            let query_count = hostname_queries.len() as i64;
+            for (hostname, rr_type) in &hostname_queries {
+                self.pending_intf_cleanup
+                    .extend(self.send_query(hostname, *rr_type));
             }
 
             self.increase_counter(Counter::CacheRefreshAddr, query_count);
@@ -1389,6 +1384,9 @@ impl Zeroconf {
 
                 self.check_ip_changes();
             }
+
+            // Clean up any interfaces that became invalid during this iteration.
+            self.process_pending_intf_cleanup();
         }
     }
 
@@ -1812,6 +1810,7 @@ impl Zeroconf {
                 .or_insert_with(DnsRegistry::new),
         };
 
+        let mut invalid_intf_addrs = HashSet::new();
         for (_, service_info) in self.my_services.iter_mut() {
             if service_info.is_addr_auto() {
                 service_info.insert_ipaddr(&intf);
@@ -1837,16 +1836,20 @@ impl Zeroconf {
                         }
                         service_info.set_status(if_index, ServiceStatus::Probing);
                     }
-                    Err(InternalError::IntfAddrInvalid(_)) => {
-                        // Interface became invalid during add_interface;
-                        // the periodic check_ip_changes will clean up.
+                    Err(InternalError::IntfAddrInvalid(intf_addr)) => {
                         debug!(
                             "add_interface: interface {} became invalid while announcing",
-                            intf.name
+                            intf_addr.name
                         );
+                        invalid_intf_addrs.insert(intf_addr);
+                        break; // Interface is dead, no point trying other services.
                     }
                 }
             }
+        }
+
+        if !invalid_intf_addrs.is_empty() {
+            self.pending_intf_cleanup.extend(invalid_intf_addrs);
         }
 
         // As we added a new interface, we want to execute all active "Browse" reruns now.
@@ -1983,7 +1986,7 @@ impl Zeroconf {
         }
 
         if !invalid_intf_addrs.is_empty() {
-            let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
+            self.pending_intf_cleanup.extend(invalid_intf_addrs);
         }
 
         // RFC 6762 section 8.3.
@@ -2108,7 +2111,7 @@ impl Zeroconf {
         }
 
         if !invalid_intf_addrs.is_empty() {
-            let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
+            self.pending_intf_cleanup.extend(invalid_intf_addrs);
         }
     }
 
@@ -2117,7 +2120,7 @@ impl Zeroconf {
         info: &ServiceInfo,
         intf: &MyIntf,
         sock: &PktInfoUdpSocket,
-    ) -> Vec<u8> {
+    ) -> (Vec<u8>, HashSet<Interface>) {
         let is_ipv4 = sock.domain() == Domain::IPV4;
 
         let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
@@ -2175,7 +2178,7 @@ impl Zeroconf {
         };
 
         if if_addrs.is_empty() {
-            return vec![];
+            return (vec![], HashSet::new());
         }
 
         for address in if_addrs {
@@ -2193,15 +2196,17 @@ impl Zeroconf {
         }
 
         // Only (at most) one packet is expected to be sent out.
-        let sent_vec = match send_dns_outgoing(&out, intf, sock, self.port) {
-            Ok(sent_vec) => sent_vec,
+        let (sent_vec, invalid) = match send_dns_outgoing(&out, intf, sock, self.port) {
+            Ok(sent_vec) => (sent_vec, HashSet::new()),
             Err(InternalError::IntfAddrInvalid(intf_addr)) => {
-                let invalid_intf_addrs = HashSet::from([intf_addr]);
-                let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
-                vec![]
+                debug!(
+                    "unregister_service: interface {} became invalid (best-effort goodbye)",
+                    intf_addr.name
+                );
+                (vec![], HashSet::from([intf_addr]))
             }
         };
-        sent_vec.into_iter().next().unwrap_or_default()
+        (sent_vec.into_iter().next().unwrap_or_default(), invalid)
     }
 
     /// Binds a channel `listener` to querying mDNS hostnames.
@@ -2222,12 +2227,14 @@ impl Zeroconf {
     }
 
     /// Sends a multicast query for `name` with `qtype`.
-    fn send_query(&self, name: &str, qtype: RRType) {
-        self.send_query_vec(&[(name, qtype)]);
+    /// Returns any interfaces that became invalid during sending.
+    fn send_query(&self, name: &str, qtype: RRType) -> HashSet<Interface> {
+        self.send_query_vec(&[(name, qtype)])
     }
 
     /// Sends out a list of `questions` (i.e. DNS questions) via multicast.
-    fn send_query_vec(&self, questions: &[(&str, RRType)]) {
+    /// Returns any interfaces that became invalid during sending.
+    fn send_query_vec(&self, questions: &[(&str, RRType)]) -> HashSet<Interface> {
         let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
         let now = current_time_millis();
 
@@ -2266,10 +2273,7 @@ impl Zeroconf {
                 }
             }
         }
-
-        if !invalid_intf_addrs.is_empty() {
-            let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
-        }
+        invalid_intf_addrs
     }
 
     /// Reads one UDP datagram from the socket of `intf`.
@@ -2346,13 +2350,16 @@ impl Zeroconf {
             for record in records {
                 if let Some(srv) = record.record.any().downcast_ref::<DnsSrv>() {
                     if self.cache.get_addr(srv.host()).is_none() {
-                        self.send_query_vec(&[(srv.host(), RRType::A), (srv.host(), RRType::AAAA)]);
+                        let invalid = self
+                            .send_query_vec(&[(srv.host(), RRType::A), (srv.host(), RRType::AAAA)]);
+                        self.pending_intf_cleanup.extend(invalid);
                         return true;
                     }
                 }
             }
         } else {
-            self.send_query(instance, RRType::ANY);
+            let invalid = self.send_query(instance, RRType::ANY);
+            self.pending_intf_cleanup.extend(invalid);
             return true;
         }
 
@@ -3111,8 +3118,7 @@ impl Zeroconf {
             if let Err(InternalError::IntfAddrInvalid(intf_addr)) =
                 send_dns_outgoing(&out, intf, &sock.pktinfo, self.port)
             {
-                let invalid_intf_addr = HashSet::from([intf_addr]);
-                let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addr));
+                self.pending_intf_cleanup.insert(intf_addr);
             }
 
             let if_name = intf.name.clone();
@@ -3249,14 +3255,6 @@ impl Zeroconf {
                 self.exec_command_verify(instance_fullname, timeout, repeating);
             }
 
-            Command::InvalidIntfAddrs(invalid_intf_addrs) => {
-                for intf_addr in invalid_intf_addrs {
-                    self.del_interface_addr(&intf_addr);
-                }
-
-                self.check_ip_changes();
-            }
-
             _ => {
                 debug!("unexpected command: {:?}", &command);
             }
@@ -3355,7 +3353,8 @@ impl Zeroconf {
             return;
         }
 
-        self.send_query(&ty, RRType::PTR);
+        self.pending_intf_cleanup
+            .extend(self.send_query(&ty, RRType::PTR));
         self.increase_counter(Counter::Browse, 1);
 
         let next_time = now + (next_delay * 1000) as u64;
@@ -3389,7 +3388,8 @@ impl Zeroconf {
             self.query_cache_for_hostname(&hostname, listener.clone());
         }
 
-        self.send_query_vec(&[(&hostname, RRType::A), (&hostname, RRType::AAAA)]);
+        self.pending_intf_cleanup
+            .extend(self.send_query_vec(&[(&hostname, RRType::A), (&hostname, RRType::AAAA)]));
         self.increase_counter(Counter::ResolveHostname, 1);
 
         let now = current_time_millis();
@@ -3439,7 +3439,8 @@ impl Zeroconf {
 
                 for (if_index, intf) in self.my_intfs.iter() {
                     if let Some(sock) = self.ipv4_sock.as_ref() {
-                        let packet = self.unregister_service(&info, intf, &sock.pktinfo);
+                        let (packet, invalid) = self.unregister_service(&info, intf, &sock.pktinfo);
+                        self.pending_intf_cleanup.extend(invalid);
                         // repeat for one time just in case some peers miss the message
                         if !repeating && !packet.is_empty() {
                             let next_time = current_time_millis() + 120;
@@ -3453,7 +3454,8 @@ impl Zeroconf {
 
                     // ipv6
                     if let Some(sock) = self.ipv6_sock.as_ref() {
-                        let packet = self.unregister_service(&info, intf, &sock.pktinfo);
+                        let (packet, invalid) = self.unregister_service(&info, intf, &sock.pktinfo);
+                        self.pending_intf_cleanup.extend(invalid);
                         if !repeating && !packet.is_empty() {
                             let next_time = current_time_millis() + 120;
                             self.retransmissions.push(ReRun {
@@ -3631,7 +3633,7 @@ impl Zeroconf {
         }
 
         if !invalid_intf_addrs.is_empty() {
-            let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
+            self.pending_intf_cleanup.extend(invalid_intf_addrs);
         }
 
         self.increase_counter(Counter::RegisterResend, 1);
@@ -3662,7 +3664,8 @@ impl Zeroconf {
                 .iter()
                 .map(|(record, rr_type)| (record.as_str(), *rr_type))
                 .collect();
-            self.send_query_vec(&query_vec);
+            self.pending_intf_cleanup
+                .extend(self.send_query_vec(&query_vec));
 
             if let Some(new_expire) = expire_at {
                 self.add_timer(new_expire); // ensure a check for the new expire time.
@@ -3679,12 +3682,13 @@ impl Zeroconf {
         let mut query_srv_count = 0;
         let mut new_timers = HashSet::new();
         let mut query_addr_count = 0;
+        let mut invalid_intfs = HashSet::new();
 
         for (ty_domain, _sender) in self.service_queriers.iter() {
             let refreshed_timers = self.cache.refresh_due_ptr(ty_domain);
             if !refreshed_timers.is_empty() {
                 trace!("sending refresh query for PTR: {}", ty_domain);
-                self.send_query(ty_domain, RRType::PTR);
+                invalid_intfs.extend(self.send_query(ty_domain, RRType::PTR));
                 query_ptr_count += 1;
                 new_timers.extend(refreshed_timers);
             }
@@ -3696,14 +3700,16 @@ impl Zeroconf {
                     .into_iter()
                     .map(|ty| (instance.as_str(), ty))
                     .collect::<Vec<_>>();
-                self.send_query_vec(&query_vec);
+                invalid_intfs.extend(self.send_query_vec(&query_vec));
                 query_srv_count += 1;
             }
             new_timers.extend(timers);
             let (hostnames, timers) = self.cache.refresh_due_hosts(ty_domain);
             for hostname in hostnames.iter() {
                 trace!("sending refresh queries for A and AAAA:  {}", hostname);
-                self.send_query_vec(&[(hostname, RRType::A), (hostname, RRType::AAAA)]);
+                invalid_intfs.extend(
+                    self.send_query_vec(&[(hostname, RRType::A), (hostname, RRType::AAAA)]),
+                );
                 query_addr_count += 2;
             }
             new_timers.extend(timers);
@@ -3712,6 +3718,8 @@ impl Zeroconf {
         for timer in new_timers {
             self.add_timer(timer);
         }
+
+        self.pending_intf_cleanup.extend(invalid_intfs);
 
         self.increase_counter(Counter::CacheRefreshPTR, query_ptr_count);
         self.increase_counter(Counter::CacheRefreshSrvTxt, query_srv_count);
@@ -3907,9 +3915,6 @@ enum Command {
     /// before its TTL expires.
     Verify(String, Duration),
 
-    /// Invalidate some interface addresses.
-    InvalidIntfAddrs(HashSet<Interface>),
-
     Exit(Sender<DaemonStatus>),
 }
 
@@ -3932,7 +3937,6 @@ impl fmt::Display for Command {
             Self::UnregisterResend(_, _, _) => write!(f, "Command UnregisterResend"),
             Self::Resolve(_, _) => write!(f, "Command Resolve"),
             Self::Verify(_, _) => write!(f, "Command VerifyResource"),
-            Self::InvalidIntfAddrs(_) => write!(f, "Command InvalidIntfAddrs"),
         }
     }
 }
