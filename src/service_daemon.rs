@@ -397,20 +397,13 @@ impl ServiceDaemon {
             TrySendError::Disconnected(_) => Error::DaemonShutdown,
         })?;
 
-        // Second, send a signal to notify the daemon.
+        // Second, send a signal to notify the daemon (best effort).
+        // The command is already in the channel, so it will be processed
+        // on the next poll iteration even if the signal fails.
         let addr = SocketAddrV4::new(LOOPBACK_V4, 0);
-        let socket = UdpSocket::bind(addr)
-            .map_err(|e| e_fmt!("Failed to create socket to send signal: {}", e))?;
-        socket
-            .send_to(cmd_name.as_bytes(), self.signal_addr)
-            .map_err(|e| {
-                e_fmt!(
-                    "signal socket send_to {} ({}) failed: {}",
-                    self.signal_addr,
-                    cmd_name,
-                    e
-                )
-            })?;
+        if let Ok(socket) = UdpSocket::bind(addr) {
+            let _ = socket.send_to(cmd_name.as_bytes(), self.signal_addr);
+        }
 
         Ok(())
     }
@@ -1406,18 +1399,9 @@ impl Zeroconf {
         })?;
 
         let addr = SocketAddrV4::new(LOOPBACK_V4, 0);
-        let socket = UdpSocket::bind(addr)
-            .map_err(|e| e_fmt!("Failed to create socket to send signal: {}", e))?;
-        socket
-            .send_to(cmd_name.as_bytes(), self.signal_addr)
-            .map_err(|e| {
-                e_fmt!(
-                    "signal socket send_to {} ({}) failed: {}",
-                    self.signal_addr,
-                    cmd_name,
-                    e
-                )
-            })?;
+        if let Ok(socket) = UdpSocket::bind(addr) {
+            let _ = socket.send_to(cmd_name.as_bytes(), self.signal_addr);
+        }
 
         Ok(())
     }
@@ -2190,24 +2174,35 @@ impl Zeroconf {
                     continue;
                 }
 
-                if let Ok(true) = announce_service_on_intf(
+                match announce_service_on_intf(
                     dns_registry,
                     service_info,
                     my_intf,
                     &sock.pktinfo,
                     self.port,
                 ) {
-                    debug!(
-                        "Announce service {} on {}",
-                        service_info.get_fullname(),
-                        intf.ip()
-                    );
-                    service_info.set_status(if_index, ServiceStatus::Announced);
-                } else {
-                    for timer in dns_registry.new_timers.drain(..) {
-                        self.timers.push(Reverse(timer));
+                    Ok(true) => {
+                        debug!(
+                            "Announce service {} on {}",
+                            service_info.get_fullname(),
+                            intf.ip()
+                        );
+                        service_info.set_status(if_index, ServiceStatus::Announced);
                     }
-                    service_info.set_status(if_index, ServiceStatus::Probing);
+                    Ok(false) => {
+                        for timer in dns_registry.new_timers.drain(..) {
+                            self.timers.push(Reverse(timer));
+                        }
+                        service_info.set_status(if_index, ServiceStatus::Probing);
+                    }
+                    Err(InternalError::IntfAddrInvalid(_)) => {
+                        // Interface became invalid during add_interface;
+                        // the periodic check_ip_changes will clean up.
+                        debug!(
+                            "add_interface: interface {} became invalid while announcing",
+                            intf.name
+                        );
+                    }
                 }
             }
         }
@@ -3782,12 +3777,7 @@ impl Zeroconf {
 
             Command::RegisterResend(fullname, intf) => {
                 trace!("register-resend service: {fullname} on {}", &intf);
-                if let Err(InternalError::IntfAddrInvalid(intf_addr)) =
-                    self.exec_command_register_resend(fullname, intf)
-                {
-                    let invalid_intf_addr = HashSet::from([intf_addr]);
-                    let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addr));
-                }
+                self.exec_command_register_resend(fullname, intf);
             }
 
             Command::Unregister(fullname, resp_s) => {
@@ -4182,27 +4172,41 @@ impl Zeroconf {
         }
     }
 
-    fn exec_command_register_resend(&mut self, fullname: String, if_index: u32) -> MyResult<()> {
+    fn exec_command_register_resend(&mut self, fullname: String, if_index: u32) {
         let Some(info) = self.my_services.get_mut(&fullname) else {
             trace!("announce: cannot find such service {}", &fullname);
-            return Ok(());
+            return;
         };
 
         let Some(dns_registry) = self.dns_registry_map.get_mut(&if_index) else {
-            return Ok(());
+            return;
         };
 
         let Some(intf) = self.my_intfs.get(&if_index) else {
-            return Ok(());
+            return;
         };
 
+        let mut invalid_intf_addrs = HashSet::new();
+
         let announced_v4 = if let Some(sock) = self.ipv4_sock.as_ref() {
-            announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port)?
+            match announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port) {
+                Ok(announced) => announced,
+                Err(InternalError::IntfAddrInvalid(intf_addr)) => {
+                    invalid_intf_addrs.insert(intf_addr);
+                    false
+                }
+            }
         } else {
             false
         };
         let announced_v6 = if let Some(sock) = self.ipv6_sock.as_ref() {
-            announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port)?
+            match announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port) {
+                Ok(announced) => announced,
+                Err(InternalError::IntfAddrInvalid(intf_addr)) => {
+                    invalid_intf_addrs.insert(intf_addr);
+                    false
+                }
+            }
         } else {
             false
         };
@@ -4222,8 +4226,11 @@ impl Zeroconf {
             debug!("register-resend should not fail");
         }
 
+        if !invalid_intf_addrs.is_empty() {
+            let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
+        }
+
         self.increase_counter(Counter::RegisterResend, 1);
-        Ok(())
     }
 
     fn exec_command_verify(&mut self, instance: String, timeout: Duration, repeating: bool) {
