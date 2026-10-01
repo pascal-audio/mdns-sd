@@ -2876,10 +2876,57 @@ mod tests {
     use crate::InterfaceId;
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
 
     /// The `is_ipv4` argument of `to_packets`. IPv6 has the smaller of the two
     /// absolute ceilings, so it is the stricter one to encode for.
     const IPV6: bool = false;
+
+    /// Record deadlines are `Instant`s and the deltas between them are
+    /// `Duration`s, so the arithmetic has to saturate at both ends: a record
+    /// that is already past its expiry reports a zero remaining TTL instead of
+    /// underflowing, and a `now` that lies before the record's creation leaves
+    /// its TTL untouched.
+    #[test]
+    fn test_ttl_arithmetic_saturates_on_the_monotonic_clock() {
+        let mut stale = DnsPointer::new(
+            "_svc._tcp.local.",
+            RRType::PTR,
+            CLASS_IN,
+            2,
+            "a._svc._tcp.local.".to_string(),
+        );
+        let long_after = stale.record.get_created() + Duration::from_secs(10);
+        assert!(stale.record.is_expired(long_after));
+        assert_eq!(stale.record.get_remaining_ttl(long_after), 0);
+        stale.record.update_ttl(long_after);
+        assert_eq!(stale.record.get_ttl(), 0);
+
+        let mut fresh = DnsPointer::new(
+            "_svc._tcp.local.",
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            "b._svc._tcp.local.".to_string(),
+        );
+        let created = fresh.record.get_created();
+        assert!(!fresh.record.is_expired(created));
+        assert_eq!(fresh.record.get_remaining_ttl(created), 120);
+        assert_eq!(
+            fresh
+                .record
+                .get_remaining_ttl(created + Duration::from_secs(50)),
+            70
+        );
+
+        let earlier = created - Duration::from_secs(5);
+        fresh.record.update_ttl(earlier);
+        assert_eq!(fresh.record.get_ttl(), 120);
+        fresh
+            .record
+            .update_ttl(created + Duration::from_millis(1_500));
+        assert_eq!(fresh.record.get_ttl(), 119);
+    }
 
     /// Found by fuzzing the packet parser.
     ///
