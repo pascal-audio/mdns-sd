@@ -7,6 +7,7 @@
 #[cfg(feature = "logging")]
 use crate::log::trace;
 
+use crate::dns_cache::current_time_millis;
 use crate::error::{e_fmt, Error, Result};
 use crate::service_info::is_unicast_link_local;
 
@@ -20,7 +21,6 @@ use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     str,
-    time::SystemTime,
 };
 
 /// Represents a network interface identifier defined by the OS.
@@ -2447,14 +2447,6 @@ impl DnsIncoming {
 
         Ok(name)
     }
-}
-
-/// Returns UNIX time in millis
-fn current_time_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("failed to get current UNIX time")
-        .as_millis() as u64
 }
 
 const fn u16_from_be_slice(bytes: &[u8]) -> u16 {

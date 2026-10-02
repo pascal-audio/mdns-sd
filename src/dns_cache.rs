@@ -11,7 +11,8 @@ use crate::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    time::SystemTime,
+    sync::OnceLock,
+    time::{Instant, SystemTime},
 };
 
 /// Associate a DnsRecord with the interface it was received on.
@@ -759,10 +760,73 @@ impl DnsCache {
     }
 }
 
-/// Returns UNIX time in millis
+/// Returns UNIX time in millis, advanced by a monotonic clock.
+///
+/// The value is anchored to the wall clock once, on first use, and then
+/// advanced with [`Instant`], so it keeps the magnitude of a UNIX timestamp
+/// while being immune to steps of the system clock (an NTP correction,
+/// `date -s`, or an RTC driver that loads after the process started and
+/// re-seats the clock). Every timer, record TTL and probe deadline in the
+/// daemon is derived from this function; when it followed `SystemTime`
+/// directly, a backwards step parked all of them until the wall clock had
+/// caught up, and a daemon started before the step never announced again.
+///
+/// Maintenance-line backport: the `pascal/v0.21.4` line carries the full
+/// `Instant`/`Duration` typing instead; this keeps the old base untouched
+/// apart from the time source.
 pub(crate) fn current_time_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("failed to get current UNIX time")
-        .as_millis() as u64
+    static ANCHOR: OnceLock<(Instant, u64)> = OnceLock::new();
+    let (started, unix_ms_at_start) = ANCHOR.get_or_init(|| {
+        let unix_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("failed to get current UNIX time")
+            .as_millis() as u64;
+        (Instant::now(), unix_ms)
+    });
+    unix_ms_at_start + started.elapsed().as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::current_time_millis;
+    use std::{
+        thread,
+        time::{Duration, SystemTime},
+    };
+
+    fn wall_clock_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    #[test]
+    fn current_time_is_unix_scaled() {
+        // Anchored to the wall clock, so it must read as a plausible UNIX
+        // timestamp in millis (within a second of the system clock here,
+        // where nothing steps the clock during the test).
+        let ours = current_time_millis();
+        let wall = wall_clock_millis();
+        assert!(ours.abs_diff(wall) < 1_000, "ours={} wall={}", ours, wall);
+    }
+
+    #[test]
+    fn current_time_never_goes_backwards_and_advances() {
+        let mut last = current_time_millis();
+        for _ in 0..50 {
+            let now = current_time_millis();
+            assert!(now >= last, "went backwards: {} -> {}", last, now);
+            last = now;
+        }
+        let before = current_time_millis();
+        thread::sleep(Duration::from_millis(20));
+        let after = current_time_millis();
+        assert!(
+            after >= before + 15,
+            "did not advance: {} -> {}",
+            before,
+            after
+        );
+    }
 }
